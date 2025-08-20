@@ -867,8 +867,56 @@ class GRPOTrainer(Trainer):
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             elif self.is_fsdp_enabled:
                 self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
+                # Extensive debug: summary of devices for ref model
+                try:
+                    cpu = cuda = meta = other = 0
+                    local_cpu = local_cuda = local_meta = local_other = 0
+                    ex_cuda_params = []
+                    ex_local_cuda = []
+                    for n, p in self.ref_model.named_parameters():
+                        t = getattr(p.device, "type", str(p.device))
+                        if t == "cpu":
+                            cpu += 1
+                        elif t == "cuda":
+                            cuda += 1
+                            if len(ex_cuda_params) < 5:
+                                ex_cuda_params.append((n, p.device))
+                        elif t == "meta":
+                            meta += 1
+                        else:
+                            other += 1
+                        lt = getattr(p, "_local_tensor", None)
+                        if lt is not None:
+                            ltd = getattr(lt, "device", None)
+                            if ltd is not None:
+                                lt_t = getattr(ltd, "type", str(ltd))
+                                if lt_t == "cpu":
+                                    local_cpu += 1
+                                elif lt_t == "cuda":
+                                    local_cuda += 1
+                                    if len(ex_local_cuda) < 5:
+                                        ex_local_cuda.append((n, ltd))
+                                elif lt_t == "meta":
+                                    local_meta += 1
+                                else:
+                                    local_other += 1
+                    first_param = next(iter(self.ref_model.parameters()), None)
+                    dm = getattr(first_param, "device_mesh", None) if first_param is not None else None
+                    self.accelerator.print(
+                        f"[DEBUG-post-prepare] ref param devices cpu={cpu}, cuda={cuda}, meta={meta}, other={other}; "
+                        f"dtensor_locals cpu={local_cpu}, cuda={local_cuda}, meta={local_meta}, other={local_other}"
+                    )
+                    self.accelerator.print(f"[DEBUG-post-prepare] examples(cuda params)={ex_cuda_params}")
+                    self.accelerator.print(f"[DEBUG-post-prepare] examples(dtensor local cuda)={ex_local_cuda}")
+                    self.accelerator.print(
+                        f"[DEBUG-post-prepare] device_mesh={dm} (dtype={getattr(dm, 'device_type', None)})"
+                    )
+                except Exception as e:
+                    self.accelerator.print(f"[DEBUG-post-prepare] error summarizing ref model devices: {e}")
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+            param = next(self.ref_model.parameters())
+            self.accelerator.print(f"[DEBUG-grpotrainer-after-prepare] ref_model device: {param.device}")
 
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
@@ -1110,6 +1158,10 @@ class GRPOTrainer(Trainer):
             if "logits_to_keep" in self.model_kwarg_keys:
                 # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
                 model_inputs["logits_to_keep"] = logits_to_keep + 1
+
+            bad = [(n, p.device) for n, p in model.named_parameters() if p.device.type != "cpu"]
+            if bad:
+                self.accelerator.print(f"[DEBUG-pre-forward] {len(bad)} params already on GPU; first few: {bad[:5]}")
 
             logits = model(**model_inputs).logits
             # Exclude the last value: it corresponds to the next token pred
@@ -1636,7 +1688,10 @@ class GRPOTrainer(Trainer):
             # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
             # old_per_token_logps to None.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            self.accelerator.print(f"[DEBUG-grpotrainer-before-get_per_token_logps] Generate every: {generate_every}, gradient_accumulation_steps: {self.args.gradient_accumulation_steps}")
             if self.args.gradient_accumulation_steps % generate_every != 0:
+                param = next(self.model.parameters())
+                self.accelerator.print(f"[DEBUG-grpotrainer-before-get_per_token_logps] Model device before _get_per_token_logps_and_entropies: {param.device}")
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
@@ -1654,6 +1709,7 @@ class GRPOTrainer(Trainer):
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
+                    self.accelerator.print(f"\n[GRPO] beta={self.beta} > 0, so calling REFERENCE MODEL forward")
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
                         prompt_completion_ids,
@@ -1666,6 +1722,7 @@ class GRPOTrainer(Trainer):
                         image_sizes=prompt_inputs.get("image_sizes"),
                     )
                 else:
+                    self.accelerator.print(f"[GRPO] Using main model with disabled adapter for ref (beta={self.beta})")
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
                         ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                             self.model,
@@ -1679,6 +1736,7 @@ class GRPOTrainer(Trainer):
                             image_sizes=prompt_inputs.get("image_sizes"),
                         )
             else:
+                self.accelerator.print(f"\n[GRPO] beta={self.beta} = 0, so SKIPPING reference model forward entirely")
                 ref_per_token_logps = None
 
         # Decode the generated completions
@@ -1791,6 +1849,8 @@ class GRPOTrainer(Trainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Get the last hidden state of the model
+        param = next(unwrapped_model.parameters())
+        self.accelerator.print(f"[DEBUG-grpotrainer-before-get_last_hidden_state] Model device before _get_last_hidden_state: {param.device}")
         last_hidden_state = self._get_last_hidden_state(
             unwrapped_model,
             input_ids,
@@ -1844,6 +1904,7 @@ class GRPOTrainer(Trainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Compute the per_token_logps and the entropy at each position in the completion
+        self.accelerator.print("\n[GRPO] Calling MAIN MODEL forward")
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,

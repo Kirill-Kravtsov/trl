@@ -25,6 +25,11 @@ from transformers import AddedToken, AutoTokenizer, PreTrainedModel, PreTrainedT
 from .modeling_value_head import AutoModelForCausalLMWithValueHead, AutoModelForSeq2SeqLMWithValueHead
 
 
+def _dbg_param_device_summary(model, accelerator, tag: str, sample: int = 5):
+    # Removed detailed per-param logging to make debugging more concise
+    pass
+
+
 SUPPORTED_ARCHITECTURES = (
     AutoModelForCausalLMWithValueHead,
     AutoModelForSeq2SeqLMWithValueHead,
@@ -371,14 +376,19 @@ def prepare_deepspeed(model: "Module", accelerator: "Accelerator"):
 
 def prepare_fsdp(model, accelerator):
     # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1421
+    import torch
     from torch.distributed.fsdp import FSDPModule
     from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+    from accelerate.utils import fsdp2_apply_ac, fsdp2_prepare_model
 
     # Check if the model is already a FSDP model due to `Manual Wrapping` and if so,
     # don't wrap it again
-    if not (isinstance(model, FSDP) or isinstance(model, FSDPModule)):
-        accelerator.state.fsdp_plugin.set_auto_wrap_policy(model)
-        fsdp_plugin = accelerator.state.fsdp_plugin
+    if isinstance(model, FSDP) or isinstance(model, FSDPModule):
+        return model.eval()
+
+    fsdp_plugin = accelerator.state.fsdp_plugin
+    if fsdp_plugin.fsdp_version == 1:
+        fsdp_plugin.set_auto_wrap_policy(model)
         kwargs = {
             "sharding_strategy": fsdp_plugin.sharding_strategy or fsdp_plugin.reshard_after_forward,
             "cpu_offload": fsdp_plugin.cpu_offload,
@@ -394,6 +404,50 @@ def prepare_fsdp(model, accelerator):
             "device_id": accelerator.device,
         }
         model = FSDP(model, **kwargs)
+    elif fsdp_plugin.fsdp_version == 2:
+        # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/23cf4ef8a3b58f016f63eeb158b4aa2c3e79fe6f/src/accelerate/accelerator.py#L1629
+        fsdp_plugin.set_auto_wrap_policy(model)
+        if fsdp_plugin.activation_checkpointing:
+            model = fsdp2_apply_ac(accelerator, model)
+
+        # Debug logging
+        if hasattr(fsdp_plugin, 'cpu_offload') and fsdp_plugin.cpu_offload is not None:
+            accelerator.print(f"[prepare_fsdp] CPU offload is enabled")
+            accelerator.print(f"[prepare_fsdp] cpu_ram_efficient_loading: {getattr(fsdp_plugin, 'cpu_ram_efficient_loading', 'not set')}")
+            # Check if model has any parameters
+            try:
+                param = next(model.parameters())
+                accelerator.print(f"[prepare_fsdp] Model device before fsdp2_prepare_model: {param.device}")
+            except StopIteration:
+                accelerator.print(f"[prepare_fsdp] Model has no parameters")
+        if accelerator.is_main_process:
+            accelerator.print(
+                f"[DBG-mesh-P] before fsdp2_prepare_model in prepare_fsdp:"
+                f" accel.mesh={getattr(accelerator,'torch_device_mesh',None)}"
+            )
+            accelerator.print(f"[DBG-mesh-P] ParallelismConfig: {accelerator.state.parallelism_config}")
+            _dbg_param_device_summary(model, accelerator, tag="pre_fsdp2_prepare_model")
+
+        model = fsdp2_prepare_model(accelerator, model)
+
+        try:
+            param = next(model.parameters())
+            accelerator.print(f"[prepare_fsdp] Model device after fsdp2_prepare_model: {param.device}")
+        except StopIteration:
+            accelerator.print(f"[prepare_fsdp] Model has no parameters")
+        if accelerator.is_main_process:
+            _dbg_param_device_summary(model, accelerator, tag="post_fsdp2_prepare_model")
+
+        # FSDP2 CPU offload fix: When using CPU offload with cpu_ram_efficient_loading,
+        # the DTensors have a mismatch between their device (from DeviceMesh) and actual storage.
+        # This causes FSDP2 validation to fail for reference models.
+        # We need to ensure the model is properly initialized for CPU offload mode.
+        if getattr(fsdp_plugin, 'cpu_offload', False) and getattr(fsdp_plugin, 'cpu_ram_efficient_loading', False):
+            model.to_empty(device=torch.device('cpu'))
+
+    else:
+        raise ValueError(f"FSDP version {fsdp_plugin.fsdp_version} not supported")
+
     model.eval()
     return model
 
